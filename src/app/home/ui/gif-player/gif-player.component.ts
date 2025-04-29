@@ -23,7 +23,14 @@ interface GifPlayerState {
     @if (status() === 'loading') {
     <mat-progress-spinner mode="indeterminate" diameter="50" />
     }
-    <div>
+    <div
+      class="preload-background"
+      [style.background]="'url(' + thumbnail() + ') 50% 50% / cover no-repeat'"
+      [class.blur]="
+        status() !== 'loaded' &&
+        !['/assets/nsfw.png', '/assets/default.png'].includes(thumbnail())
+      "
+    >
       <video
         #gifPlayer
         (click)="togglePlay$.next()"
