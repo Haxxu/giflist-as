@@ -1,37 +1,39 @@
-import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
 import { Component, inject } from '@angular/core';
-import { InfiniteScrollDirective } from 'ngx-infinite-scroll';
 import { RedditService } from '../shared/data-access/reddit.service';
+import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
+import { InfiniteScrollModule } from 'ngx-infinite-scroll';
 import { GifListComponent } from './ui/gif-list/gif-list.component';
 import { SearchBarComponent } from './ui/search-bar/search-bar.component';
 
 @Component({
+  standalone: true,
   selector: 'app-home',
-  imports: [
-    GifListComponent,
-    InfiniteScrollDirective,
-    SearchBarComponent,
-    MatProgressSpinnerModule,
-  ],
   template: `
     <app-search-bar
       [subredditFormControl]="redditService.subredditFormControl"
     ></app-search-bar>
 
-    @if (redditService.loading()) {
-    <mat-progress-spinner
-      mode="indeterminate"
-      diameter="50"
-    ></mat-progress-spinner>
-    } @else {
     <app-gif-list
       [gifs]="redditService.gifs()"
       infiniteScroll
-      (scrolled)="redditService.pagination$.next(redditService.lastKnowGif())"
+      (scrolled)="
+        redditService.paginateAfter.set(
+          redditService.gifsLoaded.value()?.paginateAfter ?? null
+        )
+      "
       class="grid-container"
-    ></app-gif-list>
+    />
+
+    @if (redditService.gifsLoaded.isLoading()) {
+    <mat-progress-spinner mode="indeterminate" diameter="50" />
     }
   `,
+  imports: [
+    GifListComponent,
+    SearchBarComponent,
+    MatProgressSpinnerModule,
+    InfiniteScrollModule,
+  ],
   styles: [
     `
       mat-progress-spinner {

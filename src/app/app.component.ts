@@ -15,10 +15,10 @@ export class AppComponent {
 
   constructor() {
     effect(() => {
-      const error = this.redditService.error();
-      if (error !== null) {
-        this.snackBar.open(error, 'Dismiss', { duration: 2000 });
-      }
+      // const error = this.redditService.error();
+      // if (error !== null) {
+      //   this.snackBar.open(error, 'Dismiss', { duration: 2000});
+      // }
     });
   }
 }

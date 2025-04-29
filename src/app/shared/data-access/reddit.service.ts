@@ -1,116 +1,65 @@
-import { computed, inject, Injectable, signal } from '@angular/core';
-import { FormControl } from '@angular/forms';
-import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { Injectable, inject, linkedSignal } from '@angular/core';
+import { rxResource, toSignal } from '@angular/core/rxjs-interop';
+import { HttpClient } from '@angular/common/http';
 import { Gif, RedditPost, RedditResponse } from '../interfaces';
+import { FormControl } from '@angular/forms';
+import { EMPTY } from 'rxjs';
 import {
-  catchError,
-  concatMap,
+  reduce,
   debounceTime,
   distinctUntilChanged,
-  EMPTY,
   expand,
   map,
-  of,
   startWith,
-  Subject,
-  switchMap,
-} from 'rxjs';
-import { HttpClient, HttpErrorResponse } from '@angular/common/http';
+} from 'rxjs/operators';
 
-export interface GifsState {
-  gifs: Gif[];
-  error: string | null;
-  loading: boolean;
-  lastKnowGif: string | null;
-}
-
-@Injectable({
-  providedIn: 'root',
-})
+@Injectable({ providedIn: 'root' })
 export class RedditService {
   private http = inject(HttpClient);
+  private gifsPerPage = 5;
+
   subredditFormControl = new FormControl();
 
-  // state
-  private state = signal<GifsState>({
-    gifs: [],
-    error: null,
-    loading: true,
-    lastKnowGif: null,
-  });
-
-  // selectors
-  gifs = computed(() => this.state().gifs);
-  error = computed(() => this.state().error);
-  loading = computed(() => this.state().loading);
-  lastKnowGif = computed(() => this.state().lastKnowGif);
-
-  // sources
-  pagination$ = new Subject<string | null>();
-  subredditChanged$ = this.subredditFormControl.valueChanges.pipe(
+  //sources
+  private subredditChanged$ = this.subredditFormControl.valueChanges.pipe(
     debounceTime(300),
     distinctUntilChanged(),
     startWith('gifs'),
     map((subreddit) => (subreddit.length ? subreddit : 'gifs'))
   );
-  private gifsLoaded$ = this.subredditChanged$.pipe(
-    switchMap((subreddit) =>
-      this.pagination$.pipe(
-        startWith(undefined),
-        concatMap((lastKnowGif) =>
-          this.fetchFromReddit(subreddit, lastKnowGif!, 20).pipe(
-            expand((response, index) => {
-              const { gifs, gifsRequired, lastKnowGif } = response;
-              const remainingGifsToFetch = gifsRequired - gifs.length;
-              const maxAttempts = 15;
+  subreddit = toSignal(this.subredditChanged$);
 
-              const shouldKeepTrying =
-                remainingGifsToFetch > 0 &&
-                index < maxAttempts &&
-                lastKnowGif !== null;
+  paginateAfter = linkedSignal({
+    source: this.subreddit,
+    computation: () => null as string | null,
+  });
 
-              return shouldKeepTrying
-                ? this.fetchFromReddit(
-                    subreddit,
-                    lastKnowGif,
-                    remainingGifsToFetch
-                  )
-                : EMPTY;
-            })
-          )
-        )
+  gifsLoaded = rxResource({
+    request: () => ({
+      subreddit: this.subreddit(),
+      paginateAfter: this.paginateAfter(),
+    }),
+    loader: ({ request }) =>
+      this.fetchRecursivelyFromReddit(request.subreddit, request.paginateAfter),
+  });
+
+  gifs = linkedSignal<ReturnType<typeof this.gifsLoaded.value>, Gif[]>({
+    source: this.gifsLoaded.value,
+    computation: (source, prev) => {
+      // initial and page loads
+      if (typeof source === 'undefined') return prev?.value ?? [];
+
+      // clear on subreddit change
+      if (
+        !prev ||
+        !prev.value[0]?.permalink.startsWith(`/r/${source.subreddit}`)
       )
-    )
-  );
-  private error$ = new Subject<string | null>();
+        return source.gifs;
 
-  constructor() {
-    // reducers
-    this.subredditChanged$.pipe(takeUntilDestroyed()).subscribe(() =>
-      this.state.update((state) => ({
-        ...state,
-        loading: true,
-        gifs: [],
-        lastKnowGif: null,
-      }))
-    );
-
-    this.gifsLoaded$.pipe(takeUntilDestroyed()).subscribe((response) =>
-      this.state.update((state) => ({
-        ...state,
-        gifs: [...state.gifs, ...response.gifs],
-        loading: false,
-        lastKnowGif: response.lastKnowGif,
-      }))
-    );
-
-    this.error$.pipe(takeUntilDestroyed()).subscribe((error) =>
-      this.state.update((state) => ({
-        ...state,
-        error,
-      }))
-    );
-  }
+      // accumulate values on paginate
+      return [...prev.value, ...source.gifs];
+    },
+  });
 
   private fetchFromReddit(
     subreddit: string,
@@ -123,23 +72,78 @@ export class RedditService {
           (after ? `&after=${after}` : '')
       )
       .pipe(
-        catchError((err) => {
-          this.handleError(err);
-          return EMPTY;
-        }),
         map((response) => {
           const posts = response.data.children;
-          const lastKnowGif = posts.length
+          let gifs = this.convertRedditPostsToGifs(posts);
+          let paginateAfter = posts.length
             ? posts[posts.length - 1].data.name
             : null;
 
           return {
-            gifs: this.convertRedditPostsToGifs(posts),
+            gifs,
             gifsRequired,
-            lastKnowGif,
+            paginateAfter,
+            subreddit,
           };
         })
       );
+  }
+
+  private fetchRecursivelyFromReddit(
+    subreddit: string,
+    paginateAfter: string | null
+  ) {
+    return this.fetchFromReddit(
+      subreddit,
+      paginateAfter,
+      this.gifsPerPage
+    ).pipe(
+      // A single request might not give us enough valid gifs for a
+      // full page, as not every post is a valid gif
+      // Keep fetching more data until we do have enough for a page
+      expand((response, index) => {
+        const { gifs, gifsRequired, paginateAfter } = response;
+        const remainingGifsToFetch = gifsRequired - gifs.length;
+        const maxAttempts = 5;
+
+        const shouldKeepTrying =
+          remainingGifsToFetch > 0 &&
+          index < maxAttempts &&
+          paginateAfter !== null;
+
+        return shouldKeepTrying
+          ? this.fetchFromReddit(subreddit, paginateAfter, remainingGifsToFetch)
+          : EMPTY;
+      }),
+      map((response) => {
+        const { gifs, gifsRequired } = response;
+        const remainingGifsToFetch = gifsRequired - gifs.length;
+
+        if (remainingGifsToFetch < 0) {
+          // trim to page size
+          const trimmedGifs = response.gifs.slice(0, remainingGifsToFetch);
+          return {
+            ...response,
+            gifs: trimmedGifs,
+            paginateAfter: trimmedGifs[trimmedGifs.length - 1].name,
+          };
+        }
+
+        return response;
+      }),
+      reduce(
+        (acc, curr) => ({
+          ...curr,
+          gifs: [...acc.gifs, ...curr.gifs],
+        }),
+        {
+          gifs: [] as Gif[],
+          paginateAfter: null as string | null,
+          gifsRequired: this.gifsPerPage,
+          subreddit: 'gifs',
+        }
+      )
+    );
   }
 
   private convertRedditPostsToGifs(posts: RedditPost[]) {
@@ -157,7 +161,7 @@ export class RedditService {
           modifiedThumbnail.endsWith('.png');
 
         return {
-          src: this.getBestSrcFromGif(post),
+          src: this.getBestSrcForGif(post),
           author: post.data.author,
           name: post.data.name,
           permalink: post.data.permalink,
@@ -169,7 +173,7 @@ export class RedditService {
       .filter((post): post is Gif => post.src !== null);
   }
 
-  private getBestSrcFromGif(post: RedditPost) {
+  private getBestSrcForGif(post: RedditPost) {
     // If the source is in .mp4 format, leave unchanged
     if (post.data.url.indexOf('.mp4') > -1) {
       return post.data.url;
@@ -200,16 +204,5 @@ export class RedditService {
 
     // No useable formats available
     return null;
-  }
-
-  private handleError(err: HttpErrorResponse) {
-    // Handle specific error cases
-    if (err.status === 404 && err.url) {
-      this.error$.next(`Failed to load gifs for /r/${err.url.split('/')[4]}`);
-      return;
-    }
-
-    // Generic error if no cases match
-    this.error$.next(err.statusText);
   }
 }
